@@ -1,0 +1,21 @@
+{
+  "name": "s01_agent_loop",
+  "version": "1.0.0",
+  "description": "",
+  "license": "ISC",
+  "author": "",
+  "type": "commonjs",
+  "main": "code.mjs",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "prettier": {
+    "semi": false,
+    "singleQuote": true,
+    "printWidth": 150
+  },
+  "dependencies": {
+    "dotenv": "^17.4.2",
+    "gaxios": "^7.2.0"
+  }
+}
