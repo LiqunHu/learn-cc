@@ -1,3 +1,17 @@
+// The Agent Loop
+//     +----------+      +-------+      +---------+
+//     |   User   | ---> |  LLM  | ---> |  Tool   |
+//     |  prompt  |      |       |      | execute |
+//     +----------+      +---+---+      +----+----+
+//                           ^               |
+//                           |   tool_result |
+//                           +---------------+
+//                           (loop continues)
+
+// This is the core loop: feed tool results back to the model
+// until the model decides to stop. Production agents layer
+// policy, hooks, and lifecycle controls on top.
+
 import 'dotenv/config'
 import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
@@ -39,7 +53,7 @@ async function run_bash({ command }) {
       }
     }
 
-    exec(command, (error, stdout, stderr) => {
+    exec(command, { timeout: 30_000 }, (error, stdout, stderr) => {
       if (error) {
         reject(`Error executing command: ${error.message}`)
       } else if (stderr) {
