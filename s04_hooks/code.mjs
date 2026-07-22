@@ -1,20 +1,46 @@
-// Permission System
+// s04: Hooks — move extension logic out of the loop, onto hooks.
 
-// Three gates inserted before tool execution:
+//   User types query
+//        │
+//        ▼
+//   ┌──────────────────┐
+//   │ UserPromptSubmit │ ── trigger_hooks() before LLM
+//   └────────┬─────────┘
+//            ▼
+//   ┌────────────┐     ┌─────────────────────────────┐
+//   │  messages  │────▶│  LLM (stop_reason=tool_use?)│
+//   └────────────┘     │   No ──▶ Stop hooks ──▶ exit │
+//                      │   Yes ──▶ tool_use block ──┐ │
+//                      └────────────────────────────┘ │
+//                                                     ▼
+//                                           ┌──────────────────┐
+//                                           │ trigger_hooks()   │
+//                                           │  PreToolUse:      │
+//                                           │   permission_hook │
+//                                           │   log_hook        │
+//                                           └───────┬──────────┘
+//                                                   │ (not blocked)
+//                                           ┌───────▼──────────┐
+//                                           │ TOOL_HANDLERS[x]  │
+//                                           └───────┬──────────┘
+//                                                   │
+//                                           ┌───────▼──────────┐
+//                                           │ trigger_hooks()   │
+//                                           │  PostToolUse:     │
+//                                           │   large_output    │
+//                                           └───────┬──────────┘
+//                                                   │
+//                                           results ──▶ back to messages
 
-//     Gate 1: Hard deny list (rm -rf /, sudo, ...)
-//     Gate 2: Rule matching (write outside workspace? destructive cmd?)
-//     Gate 3: User approval (pause and wait for confirmation)
-
-//     +-------+    +--------+    +--------+    +--------+    +------+
-//     | Tool  | -> | Gate 1 | -> | Gate 2 | -> | Gate 3 | -> | Exec |
-//     | call  |    | deny?  |    | match? |    | allow? |    |      |
-//     +-------+    +--------+    +--------+    +--------+    +------+
-//          |            |             |             |
-//          v            v             v             v
-//       (normal)     (blocked)    (ask user)   (user says no?)
-
-// Only one line added to the agent loop:
+// Changes from s03:
+//   + HOOKS registry (event -> list of callbacks)
+//   + register_hook() / trigger_hooks()
+//   + context_inject_hook (UserPromptSubmit)
+//   + permission_hook, log_hook (PreToolUse)
+//   + large_output_hook (PostToolUse)
+//   + summary_hook (Stop)
+//   - check_permission() removed from loop body
+//     (logic moved into permission_hook, triggered via PreToolUse)
 
 import 'dotenv/config'
 import readline from 'node:readline/promises'
@@ -32,74 +58,51 @@ const model = process.env.OPENAI_MODEL || 'gpt-3.5-turbo'
 
 const PWD = process.cwd()
 
-// important: update SYSTEM to reflect the new permission system
-const SYSTEM = `You are a coding agent at ${PWD}. All destructive operations require user approval.`
+const SYSTEM = `You are a coding agent at ${PWD}. Use tools to solve tasks. Act, don't explain.`
 
-// Gate 1: Hard deny list — always forbidden
-const DENY_LIST = ["rm -rf /", "sudo", "shutdown", "reboot", "mkfs", "dd if=", "> /dev/sda"]
-function check_deny_list(command) {
-  for (const denyCommand of DENY_LIST) {
-    if (command.includes(denyCommand)) {
-      return `Blocked: ${denyCommand} is on the deny list`
-    }
+// NEW in s04: Hook System (s03 permission logic now via hooks)
+
+const HOOKS = { UserPromptSubmit: [], PreToolUse: [], PostToolUse: [], Stop: [] }
+
+function register_hook(event, callback) {
+  if (!HOOKS[event]) {
+    throw new Error(`Unknown hook event: ${event}`)
+  }
+  HOOKS[event].push(callback)
+}
+
+async function trigger_hooks(event, context) {
+  if (!HOOKS[event]) {
+    throw new Error(`Unknown hook event: ${event}`)
+  }
+  for (const callback of HOOKS[event]) {
+    const result = await callback(context)
+    if (result) return result
   }
 }
 
-// Gate 2: Rule matching — context-dependent checks
-const PERMISSION_RULES = [
-    {
-      "tools": ["write_file", "edit_file"],
-      "check": (args) => {
-        const safePath = path.resolve(PWD, args.path)
-        if (!safePath.startsWith(PWD)) {
-          return false
-        }
-        return true
-      },
-      "message": "File path escapes workspace."
-    },
-    {
-      "tools": ["bash"],
-      "check": (args) => {
-        const dangerousCommands = ["rm ", "> /etc/", "chmod 777"] 
-        for (const dangerousCommand of dangerousCommands) {
-          if (args.command.includes(dangerousCommand)) {
-            return false
-          }
-        }
-        return true
-      },
-      "message": "Potentially destructive command."
-    }
-]
-
-function check_rules(tool_name, args) {
-  for (const rule of PERMISSION_RULES) {
-    if (rule.tools.includes(tool_name)) {
-      if (!rule.check(args)) {
-        return rule.message
+const DENY_LIST = ['rm -rf /', 'sudo', 'shutdown', 'reboot', 'mkfs', 'dd if=', '> /dev/sda']
+const DESTRUCTIVE = ['rm ', '> /etc/', 'chmod 777']
+async function permission_hook({func_name, func_args}) {
+  // PreToolUse: s03 check_permission() logic moved here.
+  if (func_name === 'bash') {
+    for (const denyCommand of DENY_LIST) {
+      if (func_args.command.includes(denyCommand)) {
+        return `Blocked: ${denyCommand} is on the deny list`
       }
     }
-  }
-}
 
-// Gate 3: User approval — wait for confirmation after rule match
-async function ask_user(tool_name, args, reason) {
-  console.log(`\n\x1b[33m⚠  ${reason}\x1b[0m`)
-  console.log(`   Tool: ${tool_name}(${JSON.stringify(args)})`)
+    for (const destructiveCommand of DESTRUCTIVE) {
+      if (func_args.command.includes(destructiveCommand)) {
+        console.log(`\n\x1b[33m⚠  Potentially destructive command\x1b[0m`)
+        console.log(`   Tool: ${func_name}(${JSON.stringify(func_args)})`)
+        const choice = (await rl.question(' Allow? [y/N]')).trim().toLowerCase()
+        if (!(choice === 'y' || choice === 'yes')) {
+          return `Permission denied by user`
+        }
+      }
+    }
 
-  const choice = (await rl.question(' Allow? [y/N]')).trim().toLowerCase()
-  
-  if (choice === 'y' || choice === 'yes') {
-    return 'allow'
-  } else {
-    return 'deny'
-  }
-}
-
-// Pipeline: all three gates chained
-async function check_permission(func_name, func_args) {
-  if (func_name === 'bash') {
     const reason = check_deny_list(func_args.command)
     if (reason) {
       console.log(`\n\x1b[31m⛔  ${reason}\x1b[0m`)
@@ -107,15 +110,48 @@ async function check_permission(func_name, func_args) {
     }
   }
 
-  const reason = check_rules(func_name, func_args)
-  if (reason) {
-    const user_decision = await ask_user(func_name, func_args, reason)
-    if (user_decision === 'deny') {
-      return false
+  if (func_name === 'write_file' || func_name === 'edit_file') {
+    const safePath = path.resolve(PWD, func_args.path)
+    if (!safePath.startsWith(PWD)) {
+      console.log(`\n\x1b[33m⚠  File path escapes workspace\x1b[0m`)
+      console.log(`   Tool: ${func_name}(${JSON.stringify(func_args)})`)
+      const choice = (await rl.question(' Allow? [y/N]')).trim().toLowerCase()
+      if (!(choice === 'y' || choice === 'yes')) {
+        return `Permission denied by user`
+      }
     }
   }
-  return true
 }
+
+function log_hook(func_name, func_args) {
+  const args_preview = JSON.stringify(func_args).slice(0, 100)
+  console.log(`\n\x1b[34mℹ  Tool call: ${func_name}(${args_preview})\x1b[0m`)
+}
+
+function large_output_hook({func_name, func_args, tool_result}) {
+  if (tool_result.length > 1000) {
+    console.log(`\n\x1b[33m⚠  Large output from ${func_name} (${tool_result.length} bytes)\x1b[0m`)
+  }
+}
+
+// UserPromptSubmit hook: log user input before it reaches the LLM
+function context_inject_hook(message) {
+  console.log(`\n\x1b[32m💬 [HOOK] UserPromptSubmit: working in ${PWD}\x1b[0m`)
+}
+
+function summary_hook(message) {
+  let tool_count = 0
+  for (const msg of message) {
+    tool_count += msg.tool_calls ? msg.tool_calls.length : 0
+  }
+  console.log(`\n\x1b[32m✅ [HOOK] Stop: session used ${tool_count} tool calls\x1b[0m`)
+}
+
+register_hook('UserPromptSubmit', context_inject_hook)
+register_hook('PreToolUse', permission_hook)
+register_hook('PreToolUse', log_hook)
+register_hook('PostToolUse', large_output_hook)
+register_hook('Stop', summary_hook)
 
 async function run_bash({ command }) {
   return new Promise((resolve, reject) => {
@@ -344,19 +380,31 @@ async function agent_loop(message) {
     message.push(assistant_output)
     // If the model didn't call a tool, we're done
     if (!assistant_output.tool_calls) {
+      let force = await trigger_hooks('Stop', message)
+      if (force) {
+          message.push({ role: 'user', content: force })
+          continue
+      }
       return
     }
 
+    const results = []
     for (const tool_call of assistant_output.tool_calls) {
       const func_name = tool_call.function.name
       const func_args = JSON.parse(tool_call.function.arguments || '{}')
       console.log(`\x1b[33m${func_name}(${JSON.stringify(func_args)})\x1b[0m`)
 
-      const permission_granted = await check_permission(func_name, func_args)
-      if (!permission_granted) {
-        message.push({ role: 'tool', content: `Error: Permission denied for tool "${func_name}"`, tool_call_id: tool_call.id })
+      // s04 change: hook replaces hard-coded check_permission()
+      const blocked = await trigger_hooks('PreToolUse', { func_name, func_args })
+      if (blocked) {
+        message.push({ role: 'tool', content: `Error: ${blocked}`, tool_call_id: tool_call.id })
         continue
       }
+      // const permission_granted = await check_permission(func_name, func_args)
+      // if (!permission_granted) {
+      //   message.push({ role: 'tool', content: `Error: Permission denied for tool "${func_name}"`, tool_call_id: tool_call.id })
+      //   continue
+      // }
 
       const handler = TOOL_HANDLERS[func_name]
       if (!handler) {
@@ -365,6 +413,9 @@ async function agent_loop(message) {
       }
       try {
         const tool_result = await handler(func_args)
+
+        await trigger_hooks('PostToolUse', { func_name, func_args, tool_result })
+
         message.push({ role: 'tool', content: tool_result, tool_call_id: tool_call.id })
       } catch (err) {
         message.push({ role: 'tool', content: String(err), tool_call_id: tool_call.id })
@@ -389,6 +440,7 @@ async function main() {
       if (['q', 'quit', 'exit', ''].includes(query.trim().toLowerCase())) {
         break
       }
+      await trigger_hooks('UserPromptSubmit', query)
 
       history.push({ role: 'user', content: query })
       await agent_loop(history)
