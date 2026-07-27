@@ -1,0 +1,5 @@
+在 /Users/huliqun/Work/learn-cc/s05_todo_write 创建 example 文件夹
+在 /Users/huliqun/Work/learn-cc/s05_todo_write/example 初始化 nodejs 项目
+在 /Users/huliqun/Work/learn-cc/s05_todo_write/example 中 增加 ts 依赖
+在 /Users/huliqun/Work/learn-cc/s05_todo_write/example 中 增加 main 功能 从 cli 里读取内容并显示出来
+改为从readline 里读内容并显示
