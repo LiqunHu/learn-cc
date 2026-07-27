@@ -1,46 +1,26 @@
-// s04: Hooks — move extension logic out of the loop, onto hooks.
+// s05: TodoWrite — add a planning tool on top of s04 hooks.
 
-//   User types query
-//        │
-//        ▼
-//   ┌──────────────────┐
-//   │ UserPromptSubmit │ ── trigger_hooks() before LLM
-//   └────────┬─────────┘
-//            ▼
-//   ┌────────────┐     ┌─────────────────────────────┐
-//   │  messages  │────▶│  LLM (stop_reason=tool_use?)│
-//   └────────────┘     │   No ──▶ Stop hooks ──▶ exit │
-//                      │   Yes ──▶ tool_use block ──┐ │
-//                      └────────────────────────────┘ │
-//                                                     ▼
-//                                           ┌──────────────────┐
-//                                           │ trigger_hooks()   │
-//                                           │  PreToolUse:      │
-//                                           │   permission_hook │
-//                                           │   log_hook        │
-//                                           └───────┬──────────┘
-//                                                   │ (not blocked)
-//                                           ┌───────▼──────────┐
-//                                           │ TOOL_HANDLERS[x]  │
-//                                           └───────┬──────────┘
-//                                                   │
-//                                           ┌───────▼──────────┐
-//                                           │ trigger_hooks()   │
-//                                           │  PostToolUse:     │
-//                                           │   large_output    │
-//                                           └───────┬──────────┘
-//                                                   │
-//                                           results ──▶ back to messages
+//   +---------+      +-------+      +------------------+
+//   |  User   | ---> |  LLM  | ---> | TOOL_HANDLERS    |
+//   | prompt  |      |       |      |  bash            |
+//   +---------+      +---+---+      |  read_file       |
+//                         ^         |  write_file      |
+//                         | result  |  edit_file       |
+//                         +---------+  glob            |
+//                                       todo_write ← NEW
+//                                    +------------------+
+//                                         |
+//                          in-memory current_todos
+//                                         |
+//                         if rounds_since_todo >= 3:
+//                           inject <reminder>
 
-// Changes from s03:
-//   + HOOKS registry (event -> list of callbacks)
-//   + register_hook() / trigger_hooks()
-//   + context_inject_hook (UserPromptSubmit)
-//   + permission_hook, log_hook (PreToolUse)
-//   + large_output_hook (PostToolUse)
-//   + summary_hook (Stop)
-//   - check_permission() removed from loop body
-//     (logic moved into permission_hook, triggered via PreToolUse)
+// Changes from s04:
+//   + todo_write tool + run_todo_write() implementation
+//   + Nag reminder (inject reminder after 3 rounds without todo update)
+//   + SYSTEM prompt includes "plan before execute" guidance
+//   + rounds_since_todo counter in agent_loop
+//   Loop unchanged: new tool auto-dispatches via TOOL_HANDLERS.
 
 import 'dotenv/config'
 import readline from 'node:readline/promises'
@@ -58,7 +38,11 @@ const model = process.env.OPENAI_MODEL || 'gpt-3.5-turbo'
 
 const PWD = process.cwd()
 
-const SYSTEM = `You are a coding agent at ${PWD}. Use tools to solve tasks. Act, don't explain.`
+const SYSTEM = `You are a coding agent at ${PWD}. 
+Before starting any multi-step task, use todo_write to plan your steps.
+Update status as you go.`
+
+let CURRENT_TODOS = []
 
 // NEW in s04: Hook System (s03 permission logic now via hooks)
 
@@ -83,7 +67,7 @@ async function trigger_hooks(event, context) {
 
 const DENY_LIST = ['rm -rf /', 'sudo', 'shutdown', 'reboot', 'mkfs', 'dd if=', '> /dev/sda']
 const DESTRUCTIVE = ['rm ', '> /etc/', 'chmod 777']
-async function permission_hook({func_name, func_args}) {
+async function permission_hook({ func_name, func_args }) {
   // PreToolUse: s03 check_permission() logic moved here.
   if (func_name === 'bash') {
     for (const denyCommand of DENY_LIST) {
@@ -117,12 +101,12 @@ async function permission_hook({func_name, func_args}) {
   }
 }
 
-function log_hook(func_name, func_args) {
-  const args_preview = JSON.stringify(func_args).slice(0, 100)
+function log_hook({ func_name, func_args }) {
+  const args_preview = JSON.stringify(func_args || '').slice(0, 100)
   console.log(`\n\x1b[34mℹ  Tool call: ${func_name}(${args_preview})\x1b[0m`)
 }
 
-function large_output_hook({func_name, func_args, tool_result}) {
+function large_output_hook({ func_name, func_args, tool_result }) {
   if (tool_result.length > 1000) {
     console.log(`\n\x1b[33m⚠  Large output from ${func_name} (${tool_result.length} bytes)\x1b[0m`)
   }
@@ -147,6 +131,7 @@ register_hook('PreToolUse', log_hook)
 register_hook('PostToolUse', large_output_hook)
 register_hook('Stop', summary_hook)
 
+// FROM s02-s04 (unchanged): Tool Implementations
 async function run_bash({ command }) {
   return new Promise((resolve, reject) => {
     exec(command, { timeout: 30_000 }, (error, stdout, stderr) => {
@@ -220,6 +205,41 @@ async function run_glob({ pattern, cwd, ignore, dot, nodir, absolute, maxDepth, 
     return files.map((file) => file.filename || file).join('\n') || '(no matches)'
   } catch (error) {
     throw new Error(`Error: ${error.message}`)
+  }
+}
+
+// NEW in s05: todo_write tool — plan only, no execution
+function _normalize_todos(todos) {
+  if (typeof todos === 'string') {
+    todos = JSON.parse(todos)
+  }
+  if (!Array.isArray(todos)) {
+    throw new Error(`Todos must be an array or JSON string, got: ${JSON.stringify(todos)}`)
+  }
+  return todos.map((todo) => {
+    if (todo && todo.content && todo.status) {
+      if (todo.status !== 'pending' && todo.status !== 'in_progress' && todo.status !== 'completed') {
+        throw new Error(`Invalid todo status: ${todo.status}`)
+      }
+    } else {
+      throw new Error(`Invalid todo format: ${JSON.stringify(todo)}`)
+    }
+  })
+}
+
+function run_todo_write({ todos }) {
+  try {
+    const normalized_todos = _normalize_todos(todos)
+    CURRENT_TODOS = normalized_todos
+    const lines = ['\n\x1b[33m## Current Tasks\x1b[0m']
+    for (const [i, t] of CURRENT_TODOS.entries()) {
+      const icon = { pending: ' ', in_progress: '\x1b[36m▸\x1b[0m', completed: '\x1b[32m✓\x1b[0m' }[t.status] || ' '
+      lines.push(`  [${icon}] ${t.content}`)
+    }
+    console.log(lines.join('\n'))
+    return `Updated ${CURRENT_TODOS.length} todos`
+  } catch (error) {
+    return error.message
   }
 }
 
@@ -343,6 +363,28 @@ const TOOLS = [
       },
     },
   },
+  {
+    type: 'function',
+    function: {
+      name: 'todo_write',
+      description: 'Create and manage a task list for your current coding session.',
+      parameters: {
+        todos: {
+          type: 'array',
+          items: {
+            type: 'object',
+            properties: {
+              content: { type: 'string', description: 'Description of the task.' },
+              status: { type: 'string', enum: ['pending', 'in_progress', 'completed'], description: 'Status of the task.' },
+            },
+            required: ['content', 'status'],
+          },
+          description: 'Array of todo objects to update the current task list.',
+        },
+        required: ['todos'],
+      },
+    },
+  },
 ]
 
 const TOOL_HANDLERS = {
@@ -351,6 +393,7 @@ const TOOL_HANDLERS = {
   write_file: run_write_file,
   edit_file: run_edit_file,
   glob: run_glob,
+  todo_write: run_todo_write,
 }
 
 async function agent_loop(message) {
@@ -376,8 +419,8 @@ async function agent_loop(message) {
     if (!assistant_output.tool_calls) {
       let force = await trigger_hooks('Stop', message)
       if (force) {
-          message.push({ role: 'user', content: force })
-          continue
+        message.push({ role: 'user', content: force })
+        continue
       }
       return
     }
