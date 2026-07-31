@@ -1,2 +1,2 @@
 用子agent 在 /Users/huliqun/Work/learn-cc/s06_subagent/example 项目中去掉ts 
-子进程: 读取 docs/zh/s01-the-agent-loop.md 文件 总结下大概内容
+subagent: 读取 docs/zh/s01-the-agent-loop.md 文件 总结下大概内容
