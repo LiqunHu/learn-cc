@@ -205,6 +205,7 @@ function _normalize_todos(todos) {
       if (todo.status !== 'pending' && todo.status !== 'in_progress' && todo.status !== 'completed') {
         throw new Error(`Invalid todo status: ${todo.status}`)
       }
+      return todo
     } else {
       throw new Error(`Invalid todo format: ${JSON.stringify(todo)}`)
     }
