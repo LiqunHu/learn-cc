@@ -399,8 +399,14 @@ ${f['body']}`,
 // Build SYSTEM with memory index
 function build_system() {
 	const index = read_memory_index()
-	const memories_section = index ? `\n\Memories available:\n${index}` : ''
-	return `You are a coding agent at ${PWD}
+  const catalog = list_skills()
+	const memories_section = index ? `Memories available:\n${index}` : ''
+	return `You are a coding agent at ${PWD}, Use tools to solve tasks.
+
+Skills available:
+${catalog}
+Use load_skill to get full details when needed.
+
 ${memories_section}
 Relevant memories are injected below. Respect user preferences from memory.
 When the user says 'remember' or expresses a clear preference, extract it as a memory.`
@@ -473,7 +479,7 @@ function safePath(filePath) {
 async function run_read_file({ path, limit = 1024 }) {
 	try {
 		const safe_path = safePath(path)
-		const data = await fs.readFile(safe_path, { encoding: 'utf-8' })
+		const data = fs.readFileSync(safe_path, { encoding: 'utf-8' })
 		return data.split('\n').slice(0, limit).join('\n')
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -483,7 +489,7 @@ async function run_read_file({ path, limit = 1024 }) {
 async function run_write_file({ path, content }) {
 	try {
 		const safe_path = safePath(path)
-		await fs.writeFile(safe_path, content, { encoding: 'utf-8' })
+		fs.writeFileSync(safe_path, content, { encoding: 'utf-8' })
 		return `Wrote to ${safe_path}`
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -493,12 +499,12 @@ async function run_write_file({ path, content }) {
 async function run_edit_file({ path, old_text, new_text }) {
 	try {
 		const safe_path = safePath(path)
-		let data = await fs.readFile(safe_path, { encoding: 'utf-8' })
+		let data = fs.readFileSync(safe_path, { encoding: 'utf-8' })
 		if (!data.includes(old_text)) {
 			throw new Error(`Text "${old_text}" not found in file.`)
 		}
 		data = data.replace(old_text, new_text)
-		await fs.writeFile(safe_path, data, { encoding: 'utf-8' })
+		fs.writeFileSync(safe_path, data, { encoding: 'utf-8' })
 		return `Edited ${safe_path}`
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -1115,8 +1121,8 @@ async function agent_loop(message) {
 			message = await compact_history(message)
 		}
 		try {
+      let request_messages = JSON.parse(JSON.stringify(message))
 			if (memories_content && memory_turn !== null && memory_turn < message.length) {
-				let request_messages = JSON.parse(JSON.stringify(message))
 				request_messages[memory_turn] = {
 					...request_messages[memory_turn],
 					content: `${memories_content}
@@ -1124,7 +1130,7 @@ async function agent_loop(message) {
           ${message[memory_turn]['content']}`,
 				}
 			}
-			const request_messages = JSON.parse(JSON.stringify(message))
+			
 			const response = await request({
 				url: `${url}`,
 				method: 'POST',
@@ -1134,7 +1140,7 @@ async function agent_loop(message) {
 				},
 				data: {
 					model: model,
-					messages: [{ role: 'system', content: system }, ...message],
+					messages: [{ role: 'system', content: system }, ...request_messages],
 					max_tokens: 8000,
 					enable_thinking: false,
 					tools: TOOLS,
