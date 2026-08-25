@@ -1,0 +1,3 @@
+读取README.md
+创建 .memory/MEMORY.md 内容是 "- [test](test.md) — test memory"
+读取 s10_system_prompt/code.mjs
