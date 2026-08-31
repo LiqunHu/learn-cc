@@ -1,27 +1,24 @@
-// s11: Error Recovery — three recovery paths + exponential backoff.
+// s12: Task System — file-persisted task graph with blockedBy dependencies.
 
-// Changes from s10:
-//   - LLM call wrapped in try/except with three recovery paths
-//   - Path 1: max_tokens -> escalate 8K->64K (no append on first escalation),
-//             then continuation prompt (max 3)
-//   - Path 2: prompt_too_long -> reactive compact -> retry (once)
-//   - Path 3: 429/529 -> exponential backoff with jitter (max 10),
-//             fallback model on consecutive 529
-//   - with_retry wrapper for transient errors
-//   - RecoveryState tracks escalation / compact / 529 / model
+// Changes from s11:
+//   - Task dataclass (id, subject, description, status, owner, blockedBy)
+//   - TASKS_DIR = .tasks/ for persistent JSON storage
+//   - create_task / save_task / load_task / list_tasks / get_task
+//   - can_start: checks blockedBy all completed (missing deps = blocked)
+//   - claim_task: set owner + pending -> in_progress
+//   - complete_task: set completed + report unblocked downstream
+//   - 5 new tools: create_task, list_tasks, get_task, claim_task, complete_task
 
-// ASCII flow:
-//   messages -> prompt assembly -> compress+load -> [try] LLM [except] -> tools -> loop
-//                                                     |          |
-//                                               stop_reason   error type
-//                                               max_tokens?   prompt_too_long? -> compact
-//                                               escalate /    429/529? -> backoff
-//                                               continue      other? -> log + exit
+// Note: Teaching code keeps a basic agent loop to stay focused on the task
+// system. S11's full error recovery (RecoveryState, backoff, escalation,
+// reactive compact, fallback model) is omitted — in real CC, tasks.ts and
+// withRetry are independent layers that compose naturally.
 
 import 'dotenv/config'
 import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
-import fs, { stat } from 'node:fs'
+import fs from 'node:fs'
+import fsp from 'node:fs/promises'
 import { exec } from 'node:child_process'
 import { glob } from 'glob'
 import { request } from 'gaxios'
@@ -44,7 +41,124 @@ const SKILLS_DIR = PWD + '/skills'
 const TRANSCRIPT_DIR = PWD + '/.transcripts'
 const TOOL_RESULTS_DIR = PWD + '/.task_outputs/tool-results'
 
+fs.mkdirSync(MEMORY_DIR, { recursive: true })
+fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true })
+fs.mkdirSync(TOOL_RESULTS_DIR, { recursive: true })
+
 let CURRENT_TODOS = []
+
+// s12 ── Task System ──
+const TASKS_DIR = PWD + '/.tasks'
+fs.mkdirSync(TASKS_DIR, { recursive: true })
+
+// class Task {
+// 	id: String
+// 	subject: String
+// 	description: String
+// 	status: String
+// 	owner: String | null
+// 	blockedBy: Array[String]
+// }
+
+function _task_path(task_id) {
+	return TASKS_DIR + `/${task_id}.json`
+}
+
+async function create_task({ subject, description = '', blockedBy }) {
+	const task = {
+		id: `task_${Date.now()}_${randomInt(9999).padStart(4, '0')}}`,
+		subject,
+		description,
+		status: 'pending',
+		owner: null,
+		blockedBy: blockedBy || [],
+	}
+	await save_task(task)
+	return task
+}
+
+async function save_task(task) {
+	await fsp.writeFile(_task_path(task.id), JSON.stringify(task))
+}
+
+async function load_task(task_id) {
+	return JSON.parse(await fsp.readFile(_task_path(task_id)))
+}
+
+async function list_tasks() {
+	const tasks = []
+	for (const file of fs.globSync('task_*.json', { cwd: TASKS_DIR })) {
+		tasks.push(JSON.parse(await fsp.readFile(TASKS_DIR + '/' + file)))
+	}
+	return JSON.stringify(tasks)
+}
+
+async function get_task({ task_id }) {
+	// Return full task details as JSON.
+	const task = await load_task(task_id)
+	return JSON.stringify(task)
+}
+
+async function can_start(task_id) {
+	// Check if all blockedBy dependencies are completed.
+	// Missing dependencies are treated as blocked.
+	const task = await load_task(task_id)
+	for (let dep_id in task.blockedBy) {
+		if (!fs.existsSync(_task_path(dep_id))) {
+			return false
+		}
+
+		if ((await load_task(dep_id).status) != 'completed') {
+			return false
+		}
+	}
+	return true
+}
+
+async function claim_task({ task_id, owner = 'agent' }) {
+	const task = await load_task(task_id)
+	if (task.status == 'pending') {
+		return `Task_${task_id} is ${task.status}, cannot claim`
+	}
+
+	if (!(await can_start(task_id))) {
+		const deps = []
+		for (let d in task.blockedBy) {
+			if (!fs.existsSync(_task_path(d) || load_task(d).status != 'completed')) {
+				deps.push(d)
+			}
+		}
+		return `Blocked by: ${JSON.stringify(deps)}`
+	}
+
+	task.owner = owner
+	task.status = 'in_progress'
+	await save_task(task)
+	console.log(`  \x1b[36m[claim] ${task.subject} → in_progress (owner: ${owner})\x1b[0m`)
+	return `Claimed ${task.id} (${task.subject})`
+}
+
+async function complete_task({ task_id }) {
+	const task = load_task(task_id)
+	if (task.status != 'in_progress') {
+		return `Task ${task_id} is ${task.status}, cannot complete`
+	}
+	task.status = 'completed'
+	await save_task(task)
+	const unblocked = []
+	for (let t in await list_tasks()) {
+		if (t.status == 'pending' && t.blockedBy && (await can_start(t.id))) {
+			unblocked.push(t.subject)
+		}
+	}
+	console.log(`  \x1b[32m[complete] ${task.subject} ✓\x1b[0m`)
+	let msg = `Completed ${task.id} (${task.subject})`
+	if (unblocked) {
+		msg += `\nUnblocked: ${unblocked.join(', ')}`
+		console.log(`  \x1b[33m[unblocked] ${unblocked.join(', ')}\x1b[0m`)
+	}
+	return msg
+}
 
 // NEW in s11: error recovery
 // ── Constants ──
@@ -86,7 +200,7 @@ async function with_retry(fn, state) {
 	// Non-transient errors are re-raised for the outer handler.
 	for (let i = 0; i < MAX_RETRIES; i++) {
 		try {
-			const result = await fn()
+			const result = await fn
 			state.consecutive_529 = 0
 			return result
 		} catch (error) {
@@ -229,62 +343,59 @@ function _parse_frontmatter(text) {
 	return { meta, body: parts[2].trim() }
 }
 
-function _rebuild_index() {
+async function _rebuild_index() {
 	// Rebuild MEMORY.md index from all memory files.
 	const lines = []
 	for (const file of fs.globSync('*.md', { cwd: MEMORY_DIR })) {
 		if (file === 'MEMORY.md') continue
-		const raw = fs.readFileSync(`${MEMORY_DIR}/${file}`, 'utf8')
+		const raw = await fsp.readFile(`${MEMORY_DIR}/${file}`, 'utf8')
 		const { meta, body } = _parse_frontmatter(raw)
 		const name = meta['name'] || path.dirname(file)
 		const desc = meta['description'] || body.split('\n')[0].slice(0, 80).trim()
 		lines.push(`- [${name}](${file}) — ${desc}`)
 	}
-	fs.writeFileSync(MEMORY_INDEX, lines.length > 0 ? lines.join('\n') : '', { encoding: 'utf-8' })
+	await fsp.writeFile(MEMORY_INDEX, lines.length > 0 ? lines.join('\n') : '', { encoding: 'utf-8' })
 }
 
-function write_memory_file({ name, mem_type, description, body }) {
-	if (!fs.existsSync(MEMORY_DIR)) {
-		fs.mkdirSync(MEMORY_DIR, { recursive: true })
-	}
+async function write_memory_file({ name, mem_type, description, body }) {
 	// Write a single memory file with YAML frontmatter.
 	const slug = name.toLowerCase().replace(/\s+/g, '-').replace('/', '-')
 	const filename = `${slug}.md`
 	const filepath = `${MEMORY_DIR}/${filename}`
 	const frontmatter = `---\nname: ${name}\ndescription: ${description}\ntype: ${mem_type}\n---\n\n${body}\n`
-	fs.writeFileSync(filepath, frontmatter, { encoding: 'utf-8' })
-	_rebuild_index()
+	await fsp.writeFile(filepath, frontmatter, { encoding: 'utf-8' })
+	await _rebuild_index()
 	return filepath
 }
 
-function read_memory_index() {
+async function read_memory_index() {
 	// Read MEMORY.md index (injected into SYSTEM every turn).
 	if (fs.existsSync(MEMORY_INDEX)) {
-		const raw = fs.readFileSync(MEMORY_INDEX, 'utf8')
+		const raw = fsp.readFile(MEMORY_INDEX, 'utf8')
 		return raw
 	} else {
 		return ''
 	}
 }
 
-function read_memory_file(filename) {
+async function read_memory_file(filename) {
 	// Read a single memory file's full content.
 	const path = `${MEMORY_DIR}/${filename}`
 	if (fs.existsSync(path)) {
-		const raw = fs.readFileSync(path, 'utf8')
+		const raw = await fsp.readFile(path, 'utf8')
 		return raw
 	} else {
 		return null
 	}
 }
 
-function list_memory_files() {
+async function list_memory_files() {
 	// List all memory files with metadata.
 	const result = []
 
 	for (const file of fs.globSync('*.md', { cwd: MEMORY_DIR })) {
 		if (file === 'MEMORY.md') continue
-		const raw = fs.readFileSync(`${MEMORY_DIR}/${file}`, 'utf8')
+		const raw = await fsp.readFile(`${MEMORY_DIR}/${file}`, 'utf8')
 		const { meta, body } = _parse_frontmatter(raw)
 		result.push({
 			filename: file,
@@ -301,7 +412,7 @@ async function select_relevant_memories(messages, max_items = 5) {
 	// Select relevant memory filenames by matching recent conversation against
 	// memory names/descriptions. Uses a simple LLM call (or falls back to keyword
 	// matching on name+description).
-	const files = list_memory_files()
+	const files = await list_memory_files()
 	if (files.length === 0) {
 		return []
 	}
@@ -413,7 +524,7 @@ async function load_memories(messages) {
 
 	const parts = ['<relevant_memories>']
 	for (const filename of selected_files) {
-		const content = read_memory_file(filename)
+		const content = await read_memory_file(filename)
 		if (content) {
 			parts.push(content)
 		}
@@ -438,7 +549,7 @@ async function extract_memories(messages) {
 	}
 
 	// Check existing memories to avoid duplicates
-	const existing = list_memory_files()
+	const existing = await list_memory_files()
 	const existing_texts = existing.map((f) => `- ${f.name}: ${f.description}`.toLowerCase()).join('\n') || '(none)'
 
 	const prompt = `Extract user preferences, constraints, or project facts from this dialogue.
@@ -496,7 +607,7 @@ async function extract_memories(messages) {
 				const description = item.description || ''
 				const body = item.body || ''
 				if (description.trim().length > 0 && body.trim().length > 0) {
-					write_memory_file({ name, mem_type, description, body })
+					await write_memory_file({ name, mem_type, description, body })
 					count += 1
 				}
 				if (count > 0) {
@@ -512,7 +623,7 @@ async function extract_memories(messages) {
 const CONSOLIDATE_THRESHOLD = 10
 async function consolidate_memories() {
 	// Merge duplicate/stale memories. Triggered when file count ≥ threshold.
-	const files = list_memory_files()
+	const files = await list_memory_files()
 	if (files.length < CONSOLIDATE_THRESHOLD) {
 		return
 	}
@@ -570,7 +681,7 @@ ${f['body']}`,
 			// Remove old memory files (keep MEMORY.md)
 			for await (const file of fs.globSync('*.md', { cwd: MEMORY_DIR })) {
 				if (file !== 'MEMORY.md') {
-					await fs.unlink(`${MEMORY_DIR}/${file}`)
+					await fsp.unlink(`${MEMORY_DIR}/${file}`)
 				}
 			}
 
@@ -580,7 +691,7 @@ ${f['body']}`,
 				const description = mem.description || ''
 				const body = mem.body || ''
 				if (description.trim().length > 0 && body.trim().length > 0) {
-					write_memory_file({ name, mem_type, description, body })
+					await write_memory_file({ name, mem_type, description, body })
 				}
 			}
 
@@ -592,8 +703,8 @@ ${f['body']}`,
 }
 
 // Build SYSTEM with memory index
-function build_system() {
-	const index = read_memory_index()
+async function build_system() {
+	const index = await read_memory_index()
 	const catalog = list_skills()
 	const memories_section = index ? `Memories available:\n${index}` : ''
 	return `You are a coding agent at ${PWD}, Use tools to solve tasks.
@@ -674,7 +785,7 @@ function safePath(filePath) {
 async function run_read_file({ path, limit = 1024 }) {
 	try {
 		const safe_path = safePath(path)
-		const data = fs.readFileSync(safe_path, { encoding: 'utf-8' })
+		const data = await fsp.readFile(safe_path, { encoding: 'utf-8' })
 		return data.split('\n').slice(0, limit).join('\n')
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -684,7 +795,7 @@ async function run_read_file({ path, limit = 1024 }) {
 async function run_write_file({ path, content }) {
 	try {
 		const safe_path = safePath(path)
-		fs.writeFileSync(safe_path, content, { encoding: 'utf-8' })
+		await fsp.writeFile(safe_path, content, { encoding: 'utf-8' })
 		return `Wrote to ${safe_path}`
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -694,12 +805,12 @@ async function run_write_file({ path, content }) {
 async function run_edit_file({ path, old_text, new_text }) {
 	try {
 		const safe_path = safePath(path)
-		let data = fs.readFileSync(safe_path, { encoding: 'utf-8' })
+		let data = await fsp.readFile(safe_path, { encoding: 'utf-8' })
 		if (!data.includes(old_text)) {
 			throw new Error(`Text "${old_text}" not found in file.`)
 		}
 		data = data.replace(old_text, new_text)
-		fs.writeFileSync(safe_path, data, { encoding: 'utf-8' })
+		await fsp.writeFile(safe_path, data, { encoding: 'utf-8' })
 		return `Edited ${safe_path}`
 	} catch (error) {
 		throw new Error(`Error: ${error.message}`)
@@ -942,6 +1053,83 @@ const TOOLS = [
 			},
 		},
 	},
+	{
+		type: 'function',
+		function: {
+			name: 'create_task',
+			description: 'Create a new task with optional blockedBy dependencies.',
+			parameters: {
+				subject: {
+					type: 'string',
+					description: 'subject of the task',
+				},
+				description: {
+					type: 'string',
+					description: 'description of the task',
+				},
+				blockedBy: {
+					type: 'array',
+					items: {
+						type: 'string',
+						description: 'ID of the task that is blocked by the current task',
+					},
+				},
+				required: ['subject'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'list_tasks',
+			description: 'List all tasks with status, owner, and dependencies.',
+			parameters: {
+				required: [],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'get_task',
+			description: 'Get full details of a specific task by ID.',
+			parameters: {
+				task_id: {
+					type: 'string',
+					description: 'ID of the task',
+				},
+				required: ['task_id'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'claim_task',
+			description: 'Claim a pending task. Sets owner, changes status to in_progress.',
+			parameters: {
+				task_id: {
+					type: 'string',
+					description: 'ID of the task',
+				},
+				required: ['task_id'],
+			},
+		},
+	},
+	{
+		type: 'function',
+		function: {
+			name: 'complete_task',
+			description: 'Complete an in-progress task. Reports unblocked downstream tasks.',
+			parameters: {
+				task_id: {
+					type: 'string',
+					description: 'ID of the task',
+				},
+				required: ['task_id'],
+			},
+		},
+	},
 ]
 
 const TOOL_HANDLERS = {
@@ -952,6 +1140,11 @@ const TOOL_HANDLERS = {
 	glob: run_glob,
 	todo_write: run_todo_write,
 	load_skill: load_skill,
+	create_task: create_task,
+	list_tasks: list_tasks,
+	get_task: get_task,
+	claim_task: claim_task,
+	complete_task: complete_task,
 }
 
 const SUB_TOOLS = TOOLS.filter((tool) => tool.function.name !== 'todo_write')
@@ -1129,17 +1322,16 @@ function micro_compact(messages) {
 }
 
 // L3: toolResultBudget — persist large results to disk
-function persist_large_output(tool_call_id, content) {
+async function persist_large_output(tool_call_id, content) {
 	if (content.length <= PERSIST_THRESHOLD) {
 		return content
 	}
-	fs.mkdir(TOOL_RESULTS_DIR, { recursive: true })
 	const filename = `${TOOL_RESULTS_DIR}/${tool_call_id}.txt`
-	fs.writeFile(filename, content)
+	await fsp.writeFile(filename, content)
 	return `<persisted-output>\nFull output: ${filename}\nPreview:\n${content.substring(0, 2000)}\n</persisted-output>`
 }
 
-function tool_result_budget(messages, max_bytes = 200_000) {
+async function tool_result_budget(messages, max_bytes = 200_000) {
 	const last = messages[messages.length - 1]
 	if (!last || last['role'] != 'user') return messages
 
@@ -1148,20 +1340,18 @@ function tool_result_budget(messages, max_bytes = 200_000) {
 		return messages
 	}
 
-	messages.map((msg) => {
+	messages.map(async (msg) => {
 		if (msg['role'] == 'tool' && msg['tool_call_id']) {
-			msg['content'] = persist_large_output(msg['tool_call_id'], msg['content'])
+			msg['content'] = await persist_large_output(msg['tool_call_id'], msg['content'])
 		}
 	})
 	return messages
 }
 
 // L4: autoCompact — LLM full summary
-function write_transcript(messages) {
-	fs.mkdirSync(TRANSCRIPT_DIR, { recursive: true })
-
+async function write_transcript(messages) {
 	const path = `${TRANSCRIPT_DIR}/transcript-${Date.now()}.json`
-	fs.writeFileSync(path, JSON.stringify(messages))
+	fsp.writeFile(path, JSON.stringify(messages))
 	return path
 }
 
@@ -1206,7 +1396,7 @@ ${conversation}`
 }
 
 async function compact_history(messages) {
-	const transcript_path = write_transcript(messages)
+	const transcript_path = await write_transcript(messages)
 	console.log(`[transcript saved: ${transcript_path}]`)
 	const summary = await summarize_history(messages)
 	return [{ role: 'assistant', content: `[Compacted]\n\n${summary}` }]
@@ -1214,7 +1404,7 @@ async function compact_history(messages) {
 
 // Emergency: reactiveCompact — on API error
 async function reactive_compact(messages) {
-	const transcript = write_transcript(messages)
+	const transcript = await write_transcript(messages)
 	let tail_start = messages.length - 5 > 0 ? messages.length - 5 : 0
 	if (tail_start > 0 && tail_start < messages.length && messages[tail_start]['role'] == 'tool' && messages[tail_start - 1].tool_calls) {
 		tail_start -= 1
@@ -1338,7 +1528,7 @@ async function agent_loop(message, context) {
 
 		// s08 change: three preprocessors (0 API calls, cheap first)
 		// Order matches CC source: budget → snip → micro
-		message = tool_result_budget(message)
+		message = await tool_result_budget(message)
 		message = snip_compact(message)
 		message = micro_compact(message)
 
