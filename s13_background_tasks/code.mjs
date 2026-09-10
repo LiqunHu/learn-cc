@@ -1,18 +1,19 @@
-// s12: Task System — file-persisted task graph with blockedBy dependencies.
+// s13: Background Tasks — thread-based async execution + notification injection.
 
-// Changes from s11:
-//   - Task dataclass (id, subject, description, status, owner, blockedBy)
-//   - TASKS_DIR = .tasks/ for persistent JSON storage
-//   - create_task / save_task / load_task / list_tasks / get_task
-//   - can_start: checks blockedBy all completed (missing deps = blocked)
-//   - claim_task: set owner + pending -> in_progress
-//   - complete_task: set completed + report unblocked downstream
-//   - 5 new tools: create_task, list_tasks, get_task, claim_task, complete_task
+// Changes from s12:
+//   - threading.Thread for background execution
+//   - background_tasks dict for lifecycle tracking (bg_id, command, status)
+//   - background_results dict + threading.Lock for thread-safe storage
+//   - should_run_background: model explicit request via run_in_background param
+//   - is_slow_operation: fallback heuristic when model doesn't specify
+//   - start_background_task: dispatch to daemon thread, return bg task id
+//   - collect_background_results: gather completed, return as notifications
+//   - agent_loop: slow ops → background + placeholder, inject notifications
+//   - Notifications use <task_notification> format, not reused tool_use_id
 
-// Note: Teaching code keeps a basic agent loop to stay focused on the task
-// system. S11's full error recovery (RecoveryState, backoff, escalation,
-// reactive compact, fallback model) is omitted — in real CC, tasks.ts and
-// withRetry are independent layers that compose naturally.
+// Note: Teaching code keeps a basic agent loop to stay focused on background
+// tasks. S11's full error recovery (RecoveryState, backoff, escalation,
+// reactive compact, fallback model) is omitted.
 
 import 'dotenv/config'
 import readline from 'node:readline/promises'
@@ -25,6 +26,7 @@ import { request } from 'gaxios'
 import path from 'path'
 import YAML from 'yaml'
 import { randomInt } from 'node:crypto'
+import { Worker, isMainThread, locks, parentPort, workerData } from 'node:worker_threads'
 
 const rl = readline.createInterface({ input, output })
 
@@ -307,7 +309,7 @@ function get_system_prompt(context) {
 
 async function update_context(context, messages) {
 	// Derive context from real state: which tools exist, whether memory files exist.
-	let memories = read_memory_index()
+	let memories = await read_memory_index()
 	// if(memories){
 	// 	context = memories
 	// }
@@ -820,7 +822,7 @@ async function run_edit_file({ path, old_text, new_text }) {
 async function run_glob({ pattern, cwd, ignore, dot, nodir, absolute, maxDepth, nocase, follow }) {
 	try {
 		const extraIgnore = ignore == null ? [] : Array.isArray(ignore) ? ignore : [ignore]
-		const files = await globSync(pattern, {
+		const files = await glob(pattern, {
 			cwd: cwd ? safePath(cwd) : PWD,
 			ignore: ['node_modules/**', ...extraIgnore],
 			...(dot !== undefined && { dot }),
@@ -1506,6 +1508,134 @@ register_hook('Stop', summary_hook)
 // retry limit for reactive compact
 const MAX_REACTIVE_RETRIES = 1
 
+// Background Tasks (s13 new)
+let _bg_counter = 0
+const background_tasks = {}
+const background_results = {}
+
+function is_slow_operation(func_name, func_args) {
+	// Fallback heuristic: commands likely to take > 30s.
+	if (func_name != 'bash') {
+		return false
+	}
+
+	const cmd = func_args.command.toLowerCase() || ''
+	const slow_keywords = [
+		'install',
+		'build',
+		'test',
+		'deploy',
+		'compile',
+		'docker build',
+		'pip install',
+		'npm install',
+		'cargo build',
+		'pytest',
+		'make',
+	]
+
+	for (const slow of slow_keywords) {
+		if (cmd.includes(slow)) {
+			return true
+		}
+	}
+	return false
+}
+
+function should_run_background(func_name, func_args) {
+	// Model explicit request takes priority; fallback to heuristic.
+	if (func_args['run_in_background']) {
+		return true
+	}
+	return is_slow_operation(func_name, func_args)
+}
+
+async function execute_tool(tool_call) {
+	// Execute a tool call block, return output.
+	const func_name = tool_call.function.name
+	const func_args = JSON.parse(tool_call.function.arguments || '{}')
+
+	const handler = TOOL_HANDLERS[func_name]
+	if (handler) {
+		return await handler(func_args)
+	}
+
+	return `Error: No handler for tool "${func_name}"`
+}
+
+async function start_background_task(tool_call) {
+	_bg_counter += 1
+	const bg_id = `bg_${_bg_counter.toString().padStart(4, '0')}`
+
+	const cmd = JSON.parse(tool_call.function.arguments || '{}') || tool_call.function.name
+
+	background_tasks[bg_id] = {
+		tool_use_id: tool_call.id,
+		command: cmd,
+		status: 'running',
+	}
+
+	const worker = new Worker(new URL(import.meta.url), {
+		workerData: {
+			tool_call,
+			bg_id,
+		},
+		execArgv: [], // don't inherit parent's --inspect
+		env: { ...process.env, NODE_OPTIONS: '' }, // Cursor/VS Code injects a debug bootloader via NODE_OPTIONS
+	})
+
+	worker.on('message', (msg) => {
+		background_tasks[msg.bg_id].status = 'completed'
+		background_results[msg.bg_id] = msg.result
+	})
+
+	worker.on('error', (err) => {
+		background_tasks[bg_id].status = 'failed'
+		background_results[bg_id] = String(err)
+	})
+
+	worker.once('exit', (code) => {
+		console.log(`Worker ${bg_id} stopped with exit code ${code}`)
+	})
+
+	console.log(`  \x1b[33m[background] dispatched ${bg_id}: ${cmd.command.slice(0, 40)}\x1b[0m`)
+	return bg_id
+}
+
+async function collect_background_results() {
+	// Collect completed background results as task_notification messages.
+	const ready_ids = []
+	await locks.request('my_resource', async (lock) => {
+		for (let key of Object.keys(background_tasks)) {
+			if (background_tasks[key]['status'] == 'completed') {
+				ready_ids.push(key)
+			}
+		}
+	})
+	const notifications = []
+	for (let id of ready_ids) {
+		const task = background_tasks[id]
+		const output = background_results[id]
+		delete background_tasks[id]
+		delete background_results[id]
+
+		const summary = output.length > 200 ? output.slice(0, 200) : output
+
+		notifications.push({
+			id: task.tool_use_id,
+			text: `<task_notification>
+	<task_id>${id}</task_id>
+	<status>completed</status>
+	<command>${JSON.stringify(task['command'])}</command>
+	<summary>${summary}</summary>
+</task_notification>`,
+		})
+		console.log(`  \x1b[32m[background done] ${id}: 
+${JSON.stringify(task['command']).slice(0, 40)} (${output.length} chars)\x1b[0m`)
+	}
+	return notifications
+}
+
 async function agent_loop(message, context) {
 	let reactive_retries = 0
 	// s09: inject relevant memory content into the current user turn
@@ -1606,20 +1736,36 @@ async function agent_loop(message, context) {
 				//   continue
 				// }
 
-				const handler = TOOL_HANDLERS[func_name]
-				if (!handler) {
-					message.push({ role: 'tool', content: `Error: No handler for tool "${func_name}"`, tool_call_id: tool_call.id })
-					continue
-				}
 				try {
-					const tool_result = await handler(func_args)
+					if (should_run_background(func_name, func_args)) {
+						const bg_id = await start_background_task(tool_call)
+						message.push({
+							role: 'tool',
+							content: `[Background task ${bg_id} started] 
+	Command: ${func_args.command}.
+	Result will be available when complete.`,
+							tool_call_id: tool_call.id,
+						})
+					} else {
+						const tool_result = await execute_tool(tool_call)
 
-					await trigger_hooks('PostToolUse', { func_name, func_args, tool_result })
+						await trigger_hooks('PostToolUse', { func_name, func_args, tool_result })
 
-					message.push({ role: 'tool', content: tool_result, tool_call_id: tool_call.id })
+						message.push({ role: 'tool', content: tool_result, tool_call_id: tool_call.id })
+					}
 				} catch (err) {
 					message.push({ role: 'tool', content: String(err), tool_call_id: tool_call.id })
 				}
+			}
+
+			// Inject tool results + background notifications in one user message
+			const bg_notifications = await collect_background_results()
+			if (bg_notifications.length > 0) {
+				for (let notif of bg_notifications) {
+					message.push({ role: 'tool', content: notif.text, tool_call_id: notif.id })
+				}
+				console.log(`   \x1b[32m[inject] ${bg_notifications.length} background
+notification(s)\x1b[0m`)
 			}
 		} catch (error) {
 			if (
@@ -1676,4 +1822,14 @@ async function main() {
 	}
 }
 
-main()
+if (isMainThread) {
+	await main()
+} else {
+	console.log(workerData)
+	try {
+		const result = await execute_tool(workerData.tool_call)
+		parentPort.postMessage({ bg_id: workerData.bg_id, result })
+	} catch (error) {
+		parentPort.postMessage({ bg_id: workerData.bg_id, result: String(error) })
+	}
+}
