@@ -14,7 +14,15 @@
 // Note: Teaching code keeps a basic agent loop to stay focused on background
 // tasks. S11's full error recovery (RecoveryState, backoff, escalation,
 // reactive compact, fallback model) is omitted.
+// Main thread                              Background thread
+// +------------------------------+         +----------------------+
+// | bash(run_in_background=True) | ------> | run command          |
+// | return bg_id                 |         | queue result         |
+// | continue agent loop          | <------ +----------------------+
+// | next turn: collect           |
+// +------------------------------+
 
+import os from 'node:os'
 import 'dotenv/config'
 import readline from 'node:readline/promises'
 import { stdin as input, stdout as output } from 'node:process'
@@ -26,7 +34,6 @@ import { request } from 'gaxios'
 import path from 'path'
 import YAML from 'yaml'
 import { randomInt } from 'node:crypto'
-import { Worker, isMainThread, locks, parentPort, workerData } from 'node:worker_threads'
 
 const rl = readline.createInterface({ input, output })
 
@@ -252,10 +259,15 @@ function is_prompt_too_long_error(error) {
 
 // NEW in s09: system prompt
 // ── Prompt Sections ──
+const ENVIRONMENT_PROMPT =
+	os.platform() === 'win32'
+		? `Windows: the bash tool runs through cmd.exe; use cmd.exe syntax, not Unix Bash or PowerShell syntax.`
+		: `Unix-like: the bash tool runs the system shell.`
+
 const PROMPT_SECTIONS = {
 	identity: "You are a coding agent. Act, don't explain.",
-	tools: 'Available tools: bash, read_file, write_file, create_task, list_tasks, get_task, claim_task, complete_task.',
-	workspace: `Working directory: ${PWD}`,
+	tools: 'Available tools: bash, read_file, write_file, create_task, list_tasks, get_task, claim_task, complete_task. Set run_in_background to true only for independent bash commands.',
+	workspace: `Working directory: ${PWD}. Environment: ${ENVIRONMENT_PROMPT}.`,
 	memory: 'Relevant memories are injected below when available.',
 }
 
@@ -756,7 +768,7 @@ function list_skills() {
 }
 
 // s07: subagent gets its own system prompt — no skill loading, no task
-const SUB_SYSTEM = `You are a coding agent at ${PWD}.
+const SUB_SYSTEM = `You are a coding agent at ${PWD}.  Environment: ${ENVIRONMENT_PROMPT}.
 Complete the task you were given, then return a concise summary.
 Do not delegate further.
 `
@@ -764,8 +776,11 @@ Do not delegate further.
 // FROM s02-s04 (unchanged): Tool Implementations
 async function run_bash({ command }) {
 	return new Promise((resolve, reject) => {
-		exec(command, { timeout: 30_000 }, (error, stdout, stderr) => {
-			if (error) {
+		const timeoutMs = 30_000
+		exec(command, { timeout: timeoutMs }, (error, stdout, stderr) => {
+			if (error?.killed) {
+				reject(`Error: Command timed out after ${timeoutMs / 1000}s.`)
+			} else if (error) {
 				reject(`Error executing command: ${error.message}`)
 			} else if (stderr) {
 				resolve(`stderr: ${stderr}`)
@@ -1508,48 +1523,6 @@ register_hook('Stop', summary_hook)
 // retry limit for reactive compact
 const MAX_REACTIVE_RETRIES = 1
 
-// Background Tasks (s13 new)
-let _bg_counter = 0
-const background_tasks = {}
-const background_results = {}
-
-function is_slow_operation(func_name, func_args) {
-	// Fallback heuristic: commands likely to take > 30s.
-	if (func_name != 'bash') {
-		return false
-	}
-
-	const cmd = func_args.command.toLowerCase() || ''
-	const slow_keywords = [
-		'install',
-		'build',
-		'test',
-		'deploy',
-		'compile',
-		'docker build',
-		'pip install',
-		'npm install',
-		'cargo build',
-		'pytest',
-		'make',
-	]
-
-	for (const slow of slow_keywords) {
-		if (cmd.includes(slow)) {
-			return true
-		}
-	}
-	return false
-}
-
-function should_run_background(func_name, func_args) {
-	// Model explicit request takes priority; fallback to heuristic.
-	if (func_args['run_in_background']) {
-		return true
-	}
-	return is_slow_operation(func_name, func_args)
-}
-
 async function execute_tool(tool_call) {
 	// Execute a tool call block, return output.
 	const func_name = tool_call.function.name
@@ -1563,58 +1536,76 @@ async function execute_tool(tool_call) {
 	return `Error: No handler for tool "${func_name}"`
 }
 
-async function start_background_task(tool_call) {
+// Background Tasks (s13 new)
+let _bg_counter = 0
+const background_tasks = {}
+const background_results = {}
+
+function should_run_background(func_name, func_args) {
+	// Model explicit request takes priority; fallback to heuristic.
+	return func_name == "bash" && func_args['run_in_background'] && func_args['run_in_background'] === 'true'
+}
+
+function start_background_task(tool_call) {
 	_bg_counter += 1
 	const bg_id = `bg_${_bg_counter.toString().padStart(4, '0')}`
 
-	const cmd = JSON.parse(tool_call.function.arguments || '{}') || tool_call.function.name
+	const func_args = JSON.parse(tool_call.function.arguments || '{}')
 
 	background_tasks[bg_id] = {
 		tool_use_id: tool_call.id,
-		command: cmd,
+		command: func_args['command'],
 		status: 'running',
+		controller: new AbortController(),
 	}
 
-	const worker = new Worker(new URL(import.meta.url), {
-		workerData: {
-			tool_call,
-			bg_id,
-		},
-		execArgv: [], // don't inherit parent's --inspect
-		env: { ...process.env, NODE_OPTIONS: '' }, // Cursor/VS Code injects a debug bootloader via NODE_OPTIONS
+	exec(func_args['command'], { signal: background_tasks[bg_id].controller.signal }, (error, stdout, stderr) => {
+		if (error) {
+			background_tasks[bg_id].status = 'failed'
+			background_results[bg_id] = `Error executing command: ${error.message}`
+		} else if (stderr) {
+			background_tasks[bg_id].status = 'failed'
+			background_results[bg_id] = `stderr: ${stderr}`
+		} else {
+			background_tasks[bg_id].status = 'completed'
+			background_results[bg_id] = stdout
+		}
 	})
 
-	worker.on('message', (msg) => {
-		background_tasks[msg.bg_id].status = 'completed'
-		background_results[msg.bg_id] = msg.result
-	})
-
-	worker.on('error', (err) => {
-		background_tasks[bg_id].status = 'failed'
-		background_results[bg_id] = String(err)
-	})
-
-	worker.once('exit', (code) => {
-		console.log(`Worker ${bg_id} stopped with exit code ${code}`)
-	})
-
-	console.log(`  \x1b[33m[background] dispatched ${bg_id}: ${cmd.command.slice(0, 40)}\x1b[0m`)
+	console.log(`  \x1b[33m[background] dispatched ${bg_id}: ${func_args['command'].slice(0, 40)}\x1b[0m`)
 	return bg_id
 }
 
-async function collect_background_results() {
+function cancel_background_task(bg_id) {
+	const task = background_tasks[bg_id]
+	if (task) {
+		task.controller.abort()
+		task.status = 'cancelled'
+		background_results[bg_id] = 'Task was cancelled by user.'
+		console.log(`  \x1b[33m[background] cancelled ${bg_id}\x1b[0m`)
+	} else {
+		console.log(`  \x1b[33m[background] no such task ${bg_id}\x1b[0m`)
+	}
+}
+
+function cancel_all_background_tasks() {
+	for (let key of Object.keys(background_tasks)) {
+		cancel_background_task(key)
+	}
+}
+
+function collect_background_results() {
 	// Collect completed background results as task_notification messages.
 	const ready_ids = []
-	await locks.request('my_resource', async (lock) => {
-		for (let key of Object.keys(background_tasks)) {
-			if (background_tasks[key]['status'] == 'completed') {
-				ready_ids.push(key)
-			}
+	for (let key of Object.keys(background_tasks)) {
+		if (background_tasks[key]['status'] == 'completed' || background_tasks[key]['status'] == 'failed' || background_tasks[key]['status'] == 'cancelled') {
+			ready_ids.push(key)
 		}
-	})
+	}
 	const notifications = []
 	for (let id of ready_ids) {
 		const task = background_tasks[id]
+		const status = background_tasks[id].status
 		const output = background_results[id]
 		delete background_tasks[id]
 		delete background_results[id]
@@ -1625,7 +1616,7 @@ async function collect_background_results() {
 			id: task.tool_use_id,
 			text: `<task_notification>
 	<task_id>${id}</task_id>
-	<status>completed</status>
+	<status>${status}</status>
 	<command>${JSON.stringify(task['command'])}</command>
 	<summary>${summary}</summary>
 </task_notification>`,
@@ -1738,7 +1729,7 @@ async function agent_loop(message, context) {
 
 				try {
 					if (should_run_background(func_name, func_args)) {
-						const bg_id = await start_background_task(tool_call)
+						const bg_id = start_background_task(tool_call)
 						message.push({
 							role: 'tool',
 							content: `[Background task ${bg_id} started] 
@@ -1759,7 +1750,7 @@ async function agent_loop(message, context) {
 			}
 
 			// Inject tool results + background notifications in one user message
-			const bg_notifications = await collect_background_results()
+			const bg_notifications = collect_background_results()
 			if (bg_notifications.length > 0) {
 				for (let notif of bg_notifications) {
 					message.push({ role: 'tool', content: notif.text, tool_call_id: notif.id })
@@ -1822,14 +1813,8 @@ async function main() {
 	}
 }
 
-if (isMainThread) {
-	await main()
-} else {
-	console.log(workerData)
-	try {
-		const result = await execute_tool(workerData.tool_call)
-		parentPort.postMessage({ bg_id: workerData.bg_id, result })
-	} catch (error) {
-		parentPort.postMessage({ bg_id: workerData.bg_id, result: String(error) })
-	}
-}
+process.on('exit', (code) => {
+	cancel_all_background_tasks
+})
+
+await main()
